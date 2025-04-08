@@ -256,148 +256,16 @@ def load_pretrained(
         "use_auth_token": True if model_args.use_auth_token else None,
     }
 
-    # Check if model is in Meta format by looking for tokenizer.model file
-    is_meta_format = os.path.exists(os.path.join(model_args.model_name_or_path, "tokenizer.model"))
+    tokenizer = AutoTokenizer.from_pretrained(
+        model_args.model_name_or_path,
+        use_fast=model_args.use_fast_tokenizer,
+        padding_side="left",
+        **config_kwargs
+    )
+    if tokenizer.pad_token_id is None or tokenizer.pad_token_id == 64000: # 64000 for baichuan model (older version)
+        tokenizer.pad_token_id = 0 # set as the <unk> token
 
-    if is_meta_format:
-        logger.info(f"Detected Meta's original Llama format at {model_args.model_name_or_path}")
-
-        # Check what files are available
-        model_dir_files = os.listdir(model_args.model_name_or_path)
-        logger.info(f"Files in model directory: {model_dir_files}")
-
-        # Try to directly use LlamaTokenizerFast for better compatibility
-        try:
-            logger.info("Attempting to load tokenizer with LlamaTokenizerFast...")
-            from transformers import LlamaTokenizerFast
-            tokenizer = LlamaTokenizerFast(
-                vocab_file=os.path.join(model_args.model_name_or_path, "tokenizer.model"),
-                padding_side="left"
-            )
-            # Verify tokenizer loaded correctly
-            logger.info(f"Tokenizer vocab size: {len(tokenizer)}")
-
-            # Explicitly set pad token
-            if getattr(tokenizer, "pad_token", None) is None:
-                logger.info("Setting pad_token to eos_token")
-                tokenizer.pad_token = tokenizer.eos_token
-
-            # Test tokenizer
-            test_tokens = tokenizer("Hello world", return_tensors="pt")
-            logger.info(f"Test tokenization successful: {test_tokens['input_ids'].shape}")
-
-        except Exception as e:
-            logger.warning(f"Error loading tokenizer with LlamaTokenizerFast: {str(e)}")
-            logger.info("Trying slower but more robust approach...")
-
-            try:
-                # Try the slow tokenizer as fallback
-                from transformers import LlamaTokenizer
-                tokenizer = LlamaTokenizer(
-                    vocab_file=os.path.join(model_args.model_name_or_path, "tokenizer.model"),
-                    padding_side="left"
-                )
-
-                # Explicitly set pad token
-                if getattr(tokenizer, "pad_token", None) is None:
-                    tokenizer.pad_token = tokenizer.eos_token
-
-            except Exception as e:
-                logger.warning(f"Error loading tokenizer with LlamaTokenizer: {str(e)}")
-                logger.info("Falling back to SentencePiece direct implementation...")
-
-                try:
-                    # Most direct approach using sentencepiece directly
-                    import sentencepiece as spm
-                    from transformers import PreTrainedTokenizer
-
-                    class SimpleLlamaTokenizer(PreTrainedTokenizer):
-                        """Minimal Llama tokenizer using SentencePiece directly"""
-
-                        def __init__(self, sp_model_path, **kwargs):
-                            self.sp_model = spm.SentencePieceProcessor()
-                            self.sp_model.Load(sp_model_path)
-                            super().__init__(padding_side="left", **kwargs)
-                            self.eos_token = "<s>"
-                            self.pad_token = self.eos_token
-                            self.pad_token_id = self.sp_model.PieceToId(self.pad_token)
-
-                        def _tokenize(self, text):
-                            return self.sp_model.EncodeAsPieces(text)
-
-                        def _convert_token_to_id(self, token):
-                            return self.sp_model.PieceToId(token)
-
-                        def _convert_id_to_token(self, index):
-                            return self.sp_model.IdToPiece(index)
-
-                        def convert_tokens_to_string(self, tokens):
-                            return self.sp_model.DecodePieces(tokens)
-
-                    tokenizer = SimpleLlamaTokenizer(
-                        sp_model_path=os.path.join(model_args.model_name_or_path, "tokenizer.model")
-                    )
-
-                except Exception as e:
-                    logger.warning(f"All tokenizer approaches failed: {str(e)}")
-                    is_meta_format = False
-
-        # Create config manually if needed
-        try:
-            if not os.path.exists(os.path.join(model_args.model_name_or_path, "config.json")):
-                # Try to load params.json to create config
-                import json
-                params_path = os.path.join(model_args.model_name_or_path, "params.json")
-                if os.path.exists(params_path):
-                    with open(params_path, "r") as f:
-                        params = json.load(f)
-
-                    logger.info(f"Loaded params: {params}")
-
-                    # Create basic config from params
-                    from transformers import LlamaConfig
-                    config = LlamaConfig(
-                        vocab_size=32000,  # Default value, will be overridden if tokenizer loaded successfully
-                        hidden_size=params.get("dim", 4096),
-                        intermediate_size=params.get("hidden_dim", 11008),
-                        num_hidden_layers=params.get("n_layers", 32),
-                        num_attention_heads=params.get("n_heads", 32),
-                        max_position_embeddings=params.get("max_seq_len", 2048),
-                        rms_norm_eps=params.get("norm_eps", 1e-5)
-                    )
-
-                    # Update vocab size if tokenizer was loaded successfully
-                    if 'tokenizer' in locals() and hasattr(tokenizer, 'vocab_size'):
-                        config.vocab_size = tokenizer.vocab_size
-                else:
-                    # Fallback to auto-detecting architecture
-                    logger.warning("params.json not found. Using default Llama config.")
-                    config = AutoConfig.from_pretrained("meta-llama/Llama-2-7b", **config_kwargs)
-            else:
-                # If config.json exists, load it normally
-                config = AutoConfig.from_pretrained(model_args.model_name_or_path, **config_kwargs)
-        except Exception as e:
-            logger.warning(f"Error creating config: {str(e)}")
-            is_meta_format = False
-
-    # Standard loading for HF format
-    if not is_meta_format:
-        logger.info("Using standard Hugging Face loading approach")
-        try:
-            tokenizer = AutoTokenizer.from_pretrained(
-                model_args.model_name_or_path,
-                use_fast=model_args.use_fast_tokenizer,
-                padding_side="left",
-                **config_kwargs
-            )
-            if tokenizer.pad_token_id is None or tokenizer.pad_token_id == 64000:  # 64000 for baichuan model (older version)
-                tokenizer.pad_token_id = 0  # set as the <unk> token
-
-            config = AutoConfig.from_pretrained(model_args.model_name_or_path, **config_kwargs)
-        except Exception as e:
-            logger.error(f"Failed to load tokenizer or config: {str(e)}")
-            raise e
-
+    config = AutoConfig.from_pretrained(model_args.model_name_or_path, **config_kwargs)
     is_mergeable = True
 
     # Quantization configurations (using bitsandbytes library).
@@ -425,7 +293,7 @@ def load_pretrained(
         config_kwargs["device_map"] = {"": int(os.environ.get("LOCAL_RANK", "0"))}
         logger.info("Quantizing model to {} bit.".format(model_args.quantization_bit))
 
-    if not is_trainable:  # `device_map=auto` should be used for inference only
+    if not is_trainable: # `device_map=auto` should be used for inference only
         config_kwargs["device_map"] = "auto"
 
     if model_args.checkpoint_dir is not None and finetuning_args.finetuning_type == "full":
@@ -434,66 +302,19 @@ def load_pretrained(
         model_to_load = model_args.model_name_or_path
 
     # Load and prepare pretrained models (without valuehead).
-    if is_meta_format:
-        # Use specific Llama model class for Meta format
-        try:
-            logger.info("Attempting to load model with LlamaForCausalLM...")
-            # Try to find consolidated model file
-            consolidated_model_path = None
-            for root, dirs, files in os.walk(model_args.model_name_or_path):
-                for file in files:
-                    if file.endswith('.pth'):
-                        consolidated_model_path = os.path.join(root, file)
-                        break
-                if consolidated_model_path:
-                    break
-
-            if consolidated_model_path:
-                logger.info(f"Found consolidated model at: {consolidated_model_path}")
-
-            # Load model with Llama-specific class
-            from transformers import LlamaForCausalLM
-            model = LlamaForCausalLM.from_pretrained(
-                model_to_load,
-                config=config,
-                torch_dtype=torch.bfloat16 if model_args.compute_dtype == torch.bfloat16 else torch.float16,
-                low_cpu_mem_usage=True,
-                **config_kwargs
-            )
-        except Exception as e:
-            logger.warning(f"Error loading Llama model: {str(e)}")
-            logger.info("Falling back to standard model loading...")
-
-            try:
-                model = AutoModelForCausalLM.from_pretrained(
-                    model_to_load,
-                    config=config,
-                    torch_dtype=torch.bfloat16 if model_args.compute_dtype == torch.bfloat16 else torch.float16,
-                    low_cpu_mem_usage=True,
-                    **config_kwargs
-                )
-            except Exception as e:
-                logger.error(f"All model loading approaches failed: {str(e)}")
-                raise e
-    else:
-        try:
-            model = AutoModelForCausalLM.from_pretrained(
-                model_to_load,
-                config=config,
-                torch_dtype=torch.bfloat16 if model_args.compute_dtype == torch.bfloat16 else torch.float16,
-                low_cpu_mem_usage=True,
-                **config_kwargs
-            )
-        except Exception as e:
-            logger.error(f"Failed to load model: {str(e)}")
-            raise e
-
+    model = AutoModelForCausalLM.from_pretrained(
+        model_to_load,
+        config=config,
+        torch_dtype=torch.bfloat16 if model_args.compute_dtype == torch.bfloat16 else torch.float16,
+        low_cpu_mem_usage=True,
+        **config_kwargs
+    )
     model = prepare_model_for_training(model, finetuning_args.finetuning_type) if is_trainable else model
     model = _init_adapter(model, model_args, finetuning_args, is_trainable, is_mergeable)
 
     if not is_trainable:
-        model.requires_grad_(False)  # fix all model params
-        model = model.half() if model_args.quantization_bit is None else model  # cast from fp32 to fp16
+        model.requires_grad_(False) # fix all model params
+        model = model.half() if model_args.quantization_bit is None else model # cast from fp32 to fp16
 
     print_trainable_params(model)
 
